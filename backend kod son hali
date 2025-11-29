@@ -1,0 +1,809 @@
+from sanic import Sanic
+from sanic.response import json, text
+import hashlib, secrets, smtplib, os
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from dotenv import load_dotenv
+from sanic_cors import CORS
+import asyncio
+from functools import partial
+from sanic.exceptions import NotFound
+import aiomysql
+
+# -------------------------------------------------
+# Ortam değişkenlerini yükle (.env)
+# -------------------------------------------------
+load_dotenv()
+
+app = Sanic("Campushub06")
+CORS(app)
+
+# -------------------------------------------------
+# MySQL connection pool
+# -------------------------------------------------
+@app.listener("before_server_start")
+async def setup_db(app, loop):
+    app.ctx.db = await aiomysql.create_pool(
+        host=os.getenv("DB_HOST", "127.0.0.1"),
+        port=int(os.getenv("DB_PORT", 3306)),
+        user=os.getenv("DB_USER", "root"),
+        password=os.getenv("DB_PASS", ""),
+        db=os.getenv("DB_NAME", "event_management_system"),
+        autocommit=True,
+        charset="utf8mb4"
+    )
+    print("✅ MySQL connection pool hazır")
+
+@app.listener("after_server_stop")
+async def close_db(app, loop):
+    app.ctx.db.close()
+    await app.ctx.db.wait_closed()
+    print("🔻 MySQL connection pool kapandı")
+
+
+# -------------------------------------------------
+# Yardımcı fonksiyonlar
+# -------------------------------------------------
+async def get_user_by_email(pool, email: str):
+    """User tablosundan email ile kullanıcı çek."""
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT user_id, email, password FROM User WHERE email = %s",
+                (email,)
+            )
+            return await cur.fetchone()
+
+def send_email_sync(email, reset_link):
+    msg = EmailMessage()
+    msg["Subject"] = "CampusHub Ankara - Şifre Sıfırlama"
+    msg["From"] = os.getenv("GMAIL_USER")
+    msg["To"] = email
+    msg.set_content(
+        f"Merhaba,\n\nŞifreni sıfırlamak için: {reset_link}\n\nCampusHub Ekibi"
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(os.getenv("GMAIL_USER"), os.getenv("GMAIL_PASS"))
+        smtp.send_message(msg)
+
+
+# -------------------------------------------------
+# SSS Verileri (şimdilik memory)
+# -------------------------------------------------
+FAQ_ITEMS = [
+    {
+        "id": 1,
+        "question": "CampusHub Ankara nedir?",
+        "answer": "CampusHub Ankara, Ankara’daki üniversitelerde gerçekleşen etkinlikleri tek bir platformda toplayan öğrenci odaklı bir etkinlik keşif uygulamasıdır."
+    },
+    {
+        "id": 2,
+        "question": "Etkinlikleri nereden buluyorsunuz?",
+        "answer": "Etkinlikler üniversitelerin resmi web siteleri, kulüp sayfaları ve sosyal medya hesapları üzerinden toplanarak listelenmektedir."
+    },
+    {
+        "id": 3,
+        "question": "Bir etkinliği takvime nasıl eklerim?",
+        "answer": "Etkinlik detay sayfasında bulunan 'Takvime Ekle' butonuna tıklayarak etkinliği kişisel takviminize ekleyebilirsiniz."
+    },
+    {
+        "id": 4,
+        "question": "CampusHub Ankara’ya üye olmam gerekiyor mu?",
+        "answer": "Çoğu etkinliği görmek için üyelik gerekmez. Ancak etkinlik kaydetme ve favorileme gibi özellikler için üye olmanız gerekir."
+    },
+    {
+        "id": 5,
+        "question": "Üyelik ücretli mi?",
+        "answer": "Hayır. CampusHub Ankara tamamen ücretsiz bir platformdur."
+    },
+    {
+        "id": 6,
+        "question": "Yanlış listelenen bir etkinliği nasıl bildiririm?",
+        "answer": "Etkinlik detay sayfasındaki 'Hata Bildir' butonunu kullanarak bize ulaşabilirsiniz."
+    },
+    {
+        "id": 7,
+        "question": "Etkinlikler sadece Ankara için mi?",
+        "answer": "Şu an sadece Ankara için hizmet veriyoruz. İleride diğer şehirleri de eklemeyi planlıyoruz."
+    },
+    {
+        "id": 8,
+        "question": "Kendi kulübümün etkinliğini nasıl ekleyebilirim?",
+        "answer": "Yakında kulüpler için 'Organizatör Paneli' eklenecek. Şimdilik 'Etkinlik Ekle' formu üzerinden bize ulaşabilirsiniz."
+    },
+    {
+        "id": 9,
+        "question": "Verilerimi nasıl saklıyorsunuz?",
+        "answer": "Kullanıcı verileri güvenli sunucularda ve KVKK’ya uygun şekilde saklanmaktadır."
+    },
+    {
+        "id": 10,
+        "question": "Mobil uygulamanız var mı?",
+        "answer": "Şu an mobil uyumlu web sitemiz var. İleride Android ve iOS uygulamaları da yayınlamayı planlıyoruz."
+    },
+]
+
+
+# -------------------------------------------------
+# Ana Sayfa
+# -------------------------------------------------
+@app.get("/")
+async def home(request):
+    return text("CampusHub backend çalışıyor 🚀")
+
+
+# -------------------------------------------------
+# Kayıt Ol -> User + UserProfile
+# -------------------------------------------------
+@app.post("/api/kayit-ol")
+async def kayit_ol(request):
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    full_name = data.get("name", "").strip()
+    password = data.get("password", "")
+
+    if not email or not password or not full_name:
+        return json({"basarili": False, "mesaj": "Tüm alanları doldurmanız gerekiyor."}, status=400)
+
+    if len(password) < 6:
+        return json({"basarili": False, "mesaj": "Şifre en az 6 karakter olmalıdır."}, status=400)
+
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+
+    pool = request.app.ctx.db
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Bu email zaten var mı?
+            await cur.execute("SELECT user_id FROM User WHERE email = %s", (email,))
+            existing = await cur.fetchone()
+            if existing:
+                return json({"basarili": False, "mesaj": "Bu e-posta zaten kayıtlı."}, status=409)
+
+            # User tablosuna ekle
+            await cur.execute(
+                "INSERT INTO User (email, password) VALUES (%s, %s)",
+                (email, hashed)
+            )
+            user_id = cur.lastrowid
+
+            # UserProfile tablosuna isim ekle
+            await cur.execute(
+                "INSERT INTO UserProfile (user_id, full_name) VALUES (%s, %s)",
+                (user_id, full_name)
+            )
+
+    return json({"basarili": True, "mesaj": "Hesabınız başarıyla oluşturuldu!"}, status=201)
+
+
+# -------------------------------------------------
+# Giriş
+# -------------------------------------------------
+@app.post("/api/giris")
+async def giris(request):
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    if not email or not password:
+        return json({"basarili": False, "mesaj": "E-posta ve şifre gerekli."}, status=400)
+
+    pool = request.app.ctx.db
+    user = await get_user_by_email(pool, email)
+
+    if not user:
+        return json({"basarili": False, "mesaj": "Bu e-posta ile kayıt bulunamadı."}, status=404)
+
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    if user["password"] != hashed:
+        return json({"basarili": False, "mesaj": "Şifre yanlış."}, status=401)
+
+    # last_login güncelle
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE User SET last_login = NOW() WHERE user_id = %s",
+                (user["user_id"],)
+            )
+
+    return json({"basarili": True, "mesaj": "Hoş geldin!"}, status=200)
+
+
+# -------------------------------------------------
+# Şifremi Unuttum
+# -------------------------------------------------
+RESET_TOKENS = {}
+
+@app.post("/api/sifremi-unuttum")
+async def sifremi_unuttum(request):
+    data = request.json
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return json({"basarili": False, "mesaj": "E-posta girmelisiniz."}, status=400)
+
+    pool = request.app.ctx.db
+    user = await get_user_by_email(pool, email)
+
+    if not user:
+        return json({"basarili": False, "mesaj": "Bu e-posta sistemde kayıtlı değil."}, status=404)
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    RESET_TOKENS[token] = {"email": email, "expires_at": expires_at}
+
+    reset_link = f"http://localhost:5173/sifre-sifirla?token={token}"
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, partial(send_email_sync, email, reset_link))
+        return json({"basarili": True, "mesaj": "Şifre sıfırlama bağlantısı gönderildi."})
+    except Exception as e:
+        print("Mail gönderim hatası:", e)
+        return json({"basarili": False, "mesaj": "E-posta gönderilirken hata oluştu."}, status=500)
+
+
+# -------------------------------------------------
+# Şifre Sıfırla
+# -------------------------------------------------
+@app.post("/api/sifre-sifirla")
+async def sifre_sifirla(request):
+    data = request.json
+    token = data.get("token", "")
+    new_password = data.get("password", "")
+
+    entry = RESET_TOKENS.get(token)
+    now_utc = datetime.now(timezone.utc)
+
+    if not entry or entry["expires_at"] < now_utc:
+        return json({"basarili": False, "mesaj": "Bağlantı geçersiz veya süresi dolmuş."}, status=400)
+
+    if len(new_password) < 6:
+        return json({"basarili": False, "mesaj": "Şifre en az 6 karakter olmalıdır."}, status=400)
+
+    email = entry["email"]
+    hashed = hashlib.sha256(new_password.encode()).hexdigest()
+
+    pool = request.app.ctx.db
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE User SET password = %s WHERE email = %s",
+                (hashed, email)
+            )
+
+    del RESET_TOKENS[token]
+
+    return json({"basarili": True, "mesaj": "Şifreniz başarıyla sıfırlandı."}, status=200)
+
+
+# -------------------------------------------------
+# Etkinlikler (Event + EventDate + University)
+# -------------------------------------------------
+@app.get("/api/etkinlikler")
+async def etkinlikler(request):
+    """
+    Tüm etkinlikleri veya filtrelenmiş etkinlikleri veritabanından döner.
+    Query parametreleri:
+      - university  (üniversite adı - University.name)
+      - date        (YYYY-MM-DD formatında, EventDate.start_datetime üzerinden)
+    """
+    university_name = request.args.get("university")
+    date_str = request.args.get("date")
+
+    pool = request.app.ctx.db
+
+    query = """
+        SELECT 
+            e.event_id AS id,
+            e.title,
+            e.description,
+            e.location,
+            uni.name AS university,
+            MIN(ed.start_datetime) AS start_datetime,
+            MAX(ed.end_datetime) AS end_datetime
+        FROM Event e
+        LEFT JOIN University uni ON e.university_id = uni.university_id
+        LEFT JOIN EventDate ed ON e.event_id = ed.event_id
+        WHERE e.is_active = TRUE
+    """
+    params = []
+
+    if university_name:
+        query += " AND uni.name = %s"
+        params.append(university_name)
+
+    if date_str:
+        query += " AND DATE(ed.start_datetime) = %s"
+        params.append(date_str)
+
+    query += """
+        GROUP BY e.event_id, e.title, e.description, e.location, uni.name
+        ORDER BY e.created_at DESC
+    """
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(query, params)
+            rows = await cur.fetchall()
+
+    etkinlikler_list = []
+    for r in rows:
+        if r["start_datetime"]:
+            date_out = r["start_datetime"].strftime("%Y-%m-%d")
+            time_out = r["start_datetime"].strftime("%H:%M")
+        else:
+            date_out = None
+            time_out = None
+
+        etkinlikler_list.append({
+            "id": r["id"],
+            "title": r["title"],
+            "university": r["university"],
+            "location": r["location"],
+            "description": r["description"],
+            "date": date_out,
+            "time": time_out,
+        })
+
+    return json({
+        "basarili": True,
+        "adet": len(etkinlikler_list),
+        "etkinlikler": etkinlikler_list
+    })
+
+
+# -------------------------------------------------
+# Takvime Ekle -> addEventToFavourite
+# -------------------------------------------------
+@app.post("/api/takvim/ekle")
+async def takvime_ekle(request):
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    event_id = data.get("event_id")
+
+    if not email or not event_id:
+        return json({"basarili": False, "mesaj": "Email ve event_id gerekli."}, status=400)
+
+    pool = request.app.ctx.db
+    user = await get_user_by_email(pool, email)
+    if not user:
+        return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
+
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT event_id FROM Event WHERE event_id = %s", (event_id,))
+            exists = await cur.fetchone()
+            if not exists:
+                return json({"basarili": False, "mesaj": "Etkinlik bulunamadı."}, status=404)
+
+            await cur.execute(
+                "INSERT IGNORE INTO addEventToFavourite (user_id, event_id) VALUES (%s, %s)",
+                (user["user_id"], event_id)
+            )
+
+    return json({"basarili": True, "mesaj": "Etkinlik takvime/favorilere eklendi."}, status=200)
+
+
+# -------------------------------------------------
+# Kullanıcının takvimi
+# -------------------------------------------------
+@app.get("/api/takvim")
+async def takvim(request):
+    email = request.args.get("email", "").strip().lower()
+
+    if not email:
+        return json({"basarili": False, "mesaj": "Email gerekli."}, status=400)
+
+    pool = request.app.ctx.db
+    user = await get_user_by_email(pool, email)
+    if not user:
+        return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
+
+    query = """
+        SELECT
+            e.event_id AS id,
+            e.title,
+            e.description,
+            e.location,
+            uni.name AS university,
+            MIN(ed.start_datetime) AS start_datetime,
+            MAX(ed.end_datetime) AS end_datetime
+        FROM addEventToFavourite f
+        JOIN Event e ON f.event_id = e.event_id
+        LEFT JOIN University uni ON e.university_id = uni.university_id
+        LEFT JOIN EventDate ed ON e.event_id = ed.event_id
+        WHERE f.user_id = %s
+        GROUP BY e.event_id, e.title, e.description, e.location, uni.name
+        ORDER BY e.created_at DESC
+    """
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(query, (user["user_id"],))
+            rows = await cur.fetchall()
+
+    user_events = []
+    for r in rows:
+        if r["start_datetime"]:
+            date_out = r["start_datetime"].strftime("%Y-%m-%d")
+            time_out = r["start_datetime"].strftime("%H:%M")
+        else:
+            date_out = None
+            time_out = None
+
+        user_events.append({
+            "id": r["id"],
+            "title": r["title"],
+            "university": r["university"],
+            "location": r["location"],
+            "description": r["description"],
+            "date": date_out,
+            "time": time_out
+        })
+
+    return json({
+        "basarili": True,
+        "adet": len(user_events),
+        "etkinlikler": user_events
+    })
+
+
+# -------------------------------------------------
+# SSS (FAQ)
+# -------------------------------------------------
+@app.get("/api/faq")
+async def get_all_faqs(request):
+    return json({"faqs": FAQ_ITEMS}, status=200)
+
+@app.get("/api/faq/<faq_id:int>")
+async def get_single_faq(request, faq_id):
+    for item in FAQ_ITEMS:
+        if item["id"] == faq_id:
+            return json(item, status=200)
+    return json({"error": "FAQ bulunamadı."}, status=404)
+
+
+# -------------------------------------------------
+# Feedback API (Feedback tablosu)
+# -------------------------------------------------
+@app.post("/api/feedback")
+async def create_feedback(request):
+    data = request.json or {}
+
+    email = (data.get("email") or "").strip().lower()
+    event_id = data.get("event_id")
+    fb_type = (data.get("type") or "").strip()
+    title = (data.get("title") or "").strip()
+    message = (data.get("message") or "").strip()
+
+    if not email or not event_id or not message:
+        return json({
+            "basarili": False,
+            "mesaj": "E-posta, etkinlik ve mesaj alanları zorunludur."
+        }, status=400)
+
+    pool = request.app.ctx.db
+    user = await get_user_by_email(pool, email)
+    if not user:
+        return json({
+            "basarili": False,
+            "mesaj": "Bu e-posta ile kayıtlı kullanıcı bulunamadı."
+        }, status=404)
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT event_id FROM Event WHERE event_id = %s",
+                (event_id,)
+            )
+            event = await cur.fetchone()
+            if not event:
+                return json({
+                    "basarili": False,
+                    "mesaj": "Etkinlik bulunamadı."
+                }, status=404)
+
+            await cur.execute(
+                """
+                INSERT INTO Feedback (user_id, event_id, type, title, message, status)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (user["user_id"], event_id, fb_type or None, title or None, message, "pending")
+            )
+            feedback_id = cur.lastrowid
+
+    return json({
+        "basarili": True,
+        "mesaj": "Geri bildiriminiz alındı. Teşekkür ederiz.",
+        "feedback_id": feedback_id
+    }, status=201)
+
+
+@app.get("/api/feedback")
+async def list_feedback(request):
+    event_id = request.args.get("event_id")
+    status = request.args.get("status")
+
+    pool = request.app.ctx.db
+
+    query = """
+        SELECT 
+            f.feedback_id,
+            u.email,
+            f.event_id,
+            f.type,
+            f.title,
+            f.message,
+            f.status,
+            f.created_at
+        FROM Feedback f
+        JOIN User u ON f.user_id = u.user_id
+        WHERE 1=1
+    """
+    params = []
+
+    if event_id:
+        query += " AND f.event_id = %s"
+        params.append(event_id)
+
+    if status:
+        query += " AND f.status = %s"
+        params.append(status)
+
+    query += " ORDER BY f.created_at DESC"
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(query, params)
+            rows = await cur.fetchall()
+
+    return json({
+        "basarili": True,
+        "adet": len(rows),
+        "feedbackler": rows
+    }, status=200)
+
+
+# -------------------------------------------------
+# CONTACT / İLETİŞİM API (DB TABLOLARI İLE)
+# -------------------------------------------------
+
+# Statik içerik endpointleri (header, cards, vs.)
+@app.get("/api/contact/header")
+async def contact_header(request):
+    return json({
+        "title": "Bizimle İletişime Geç",
+        "subtitle": (
+            "CampusHub Ankara bağımsız bir öğrenci platformudur. "
+            "Etkinlik ekleme, öneri ve geri bildirim için "
+            "bu sayfadan bizimle iletişime geçebilirsin."
+        )
+    })
+
+@app.get("/api/contact/cards")
+async def contact_cards(request):
+    return json({
+        "cards": [
+            {
+                "type": "email",
+                "title": "E-posta",
+                "text": "campushub@ankara.edu.tr",
+                "href": "mailto:campushub@ankara.edu.tr",
+            },
+            {
+                "type": "github",
+                "title": "GitHub Deposu",
+                "text": "Açık kaynak kodumuzu görüntüleyin ve katkı verin.",
+                "href": "https://github.com/campushub-ankara",
+            },
+        ]
+    })
+
+@app.get("/api/contact/club-info")
+async def contact_club_info(request):
+    return json({
+        "title": "Kulüp / Topluluk Musunuz?",
+        "text": (
+            "Etkinliklerinizi CampusHub Ankara'da listelemek için "
+            "formdan bizimle iletişime geçebilir, kulübünüzü "
+            "platforma ekletmek için başvurabilirsiniz."
+        )
+    })
+
+@app.get("/api/contact/about")
+async def contact_about(request):
+    return json({
+        "title": "Biz Kimiz?",
+        "text": (
+            "CampusHub Ankara, Ankara’daki üniversite ve kulüp etkinliklerini "
+            "tek bir platformda toplayan, öğrenciler tarafından geliştirilen "
+            "bağımsız bir öğrenci girişimidir. Amacımız, sosyal medyayı aktif "
+            "kullanmayan öğrencilerin de kampüsteki fırsatlara kolayca "
+            "ulaşmasını sağlamaktır."
+        )
+    })
+
+@app.get("/api/contact/team")
+async def contact_team(request):
+    return json({
+        "title": "CampusHub Ekibi",
+        "members": [
+            {
+                "name": "İlayda Ceylan",
+                "roles": ["Backend", "CI/CD"],
+                "photo": None,
+            },
+            {
+                "name": "Zeynep Bahar Arık",
+                "roles": ["Frontend", "Data Layer", "Testing"],
+                "photo": None,
+            },
+            {
+                "name": "Zeynepnaz Yüksel",
+                "roles": ["Backend", "Frontend", "Testing"],
+                "photo": None,
+            },
+            {
+                "name": "Buğra Kılıç",
+                "roles": ["Backend", "CI/CD"],
+                "photo": None,
+            },
+            {
+                "name": "Osman Kapan Mahir",
+                "roles": ["Frontend", "Data Layer"],
+                "photo": None,
+            },
+        ]
+    })
+
+# Form seçeneklerini DB'den okuyan endpoint
+@app.get("/api/contact/form-options")
+async def contact_form_options(request):
+    """
+    ContactUserTypes ve ContactTopicTypes tablolarından
+    aktif kullanıcı tipi ve konu tiplerini döner.
+    """
+    pool = request.app.ctx.db
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Kullanıcı tipleri
+            await cur.execute(
+                "SELECT id, label FROM ContactUserTypes WHERE is_active = TRUE ORDER BY id"
+            )
+            user_types = await cur.fetchall()
+
+            # Konu tipleri
+            await cur.execute(
+                "SELECT id, label FROM ContactTopicTypes WHERE is_active = TRUE ORDER BY id"
+            )
+            topic_types = await cur.fetchall()
+
+    return json({
+        "user_types": user_types,
+        "topic_types": topic_types,
+    }, status=200)
+
+
+@app.get("/api/contact")
+async def contact_get(request):
+    return json({"ok": True, "message": "Contact endpoint çalışıyor!"}, status=200)
+
+
+# Contact form POST -> ContactMessages tablosuna kaydeder
+@app.post("/api/contact")
+async def contact_post(request):
+    data = request.json or {}
+
+    full_name = (data.get("full_name") or "").strip()
+    email = (data.get("email") or "").strip()
+    university = (data.get("university") or "").strip()
+    user_type_label = (data.get("user_type") or "").strip()
+    topic_label = (data.get("topic") or "").strip()
+    message_text = (data.get("message") or "").strip()
+    consent = data.get("consent", False)
+
+    required_fields = ["full_name", "email", "university", "user_type", "topic", "message"]
+    missing = [f for f in required_fields if not data.get(f)]
+
+    if consent is not True:
+        missing.append("consent")
+
+    if missing:
+        return json({
+            "ok": False,
+            "error": "Eksik veya doldurulmamış alanlar var.",
+            "missing": missing
+        }, status=400)
+
+    if "@" not in email:
+        return json({"ok": False, "error": "Geçersiz e-posta adresi."}, status=400)
+
+    pool = request.app.ctx.db
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # user_type_label -> ContactUserTypes.id
+            await cur.execute(
+                "SELECT id FROM ContactUserTypes WHERE label = %s AND is_active = TRUE",
+                (user_type_label,)
+            )
+            user_type_row = await cur.fetchone()
+            if not user_type_row:
+                return json({"ok": False, "error": "Geçersiz kullanıcı tipi."}, status=400)
+
+            user_type_id = user_type_row["id"]
+
+            # topic_label -> ContactTopicTypes.id
+            await cur.execute(
+                "SELECT id FROM ContactTopicTypes WHERE label = %s AND is_active = TRUE",
+                (topic_label,)
+            )
+            topic_row = await cur.fetchone()
+            if not topic_row:
+                return json({"ok": False, "error": "Geçersiz mesaj türü."}, status=400)
+
+            topic_type_id = topic_row["id"]
+
+            # ContactMessages tablosuna ekle
+            await cur.execute(
+                """
+                INSERT INTO ContactMessages 
+                (full_name, email, university, user_type_id, topic_type_id, message, consent)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (full_name, email, university, user_type_id, topic_type_id, message_text, True)
+            )
+            contact_id = cur.lastrowid
+
+    return json({
+        "ok": True,
+        "message": "İletişim formu başarıyla alındı.",
+        "contact_id": contact_id
+    }, status=201)
+
+
+# Contact mesajlarını DB'den listeleme
+@app.get("/api/contact/messages")
+async def list_messages(request):
+    """
+    ContactMessages + tip label'larıyla birlikte listeler.
+    İleride admin panelde kullanmak için güzel olur.
+    """
+    pool = request.app.ctx.db
+
+    query = """
+        SELECT 
+            c.contact_id,
+            c.full_name,
+            c.email,
+            c.university,
+            ut.label AS user_type,
+            tt.label AS topic_type,
+            c.message,
+            c.consent,
+            c.created_at
+        FROM ContactMessages c
+        LEFT JOIN ContactUserTypes ut ON c.user_type_id = ut.id
+        LEFT JOIN ContactTopicTypes tt ON c.topic_type_id = tt.id
+        ORDER BY c.created_at DESC
+    """
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(query)
+            rows = await cur.fetchall()
+
+    return json({
+        "ok": True,
+        "count": len(rows),
+        "messages": rows
+    }, status=200)
+
+
+# -------------------------------------------------
+# Çalıştır
+# -------------------------------------------------
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8000, debug=True)
