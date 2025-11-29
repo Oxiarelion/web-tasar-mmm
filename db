@@ -1,7 +1,7 @@
 DROP DATABASE IF EXISTS event_management_system;
 CREATE DATABASE event_management_system 
 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
+ 
 USE event_management_system;
 
 -- University tablosu
