@@ -1,0 +1,326 @@
+-- ================================================================
+-- EVENT MANAGEMENT SYSTEM - MYSQL DATABASE SCHEMA
+-- Düzeltilmiş ve Optimize Edilmiş Versiyon
+-- ================================================================
+
+-- Mevcut veritabanını sil ve yeniden oluştur
+DROP DATABASE IF EXISTS event_management_system;
+CREATE DATABASE event_management_system 
+CHARACTER SET utf8mb4 
+COLLATE utf8mb4_unicode_ci;
+
+USE event_management_system;
+
+-- ================================================================
+-- UNIVERSITY TABLE
+-- ================================================================
+CREATE TABLE University (
+    university_id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255) NOT NULL,
+    short_name VARCHAR(100),  -- DÜZELTME: short_name_ yerine short_name
+    website_url VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Örnek üniversiteler
+INSERT INTO University (name, short_name, website_url) VALUES
+('Ankara Üniversitesi', 'AÜ', 'https://www.ankara.edu.tr'),
+('Hacettepe Üniversitesi', 'HÜ', 'https://www.hacettepe.edu.tr'),
+('Orta Doğu Teknik Üniversitesi', 'ODTÜ', 'https://www.metu.edu.tr'),
+('İstanbul Teknik Üniversitesi', 'İTÜ', 'https://www.itu.edu.tr'),
+('Boğaziçi Üniversitesi', 'BOÜN', 'https://www.boun.edu.tr');
+
+-- ================================================================
+-- USER TABLE
+-- ================================================================
+CREATE TABLE User (
+    user_id INT PRIMARY KEY AUTO_INCREMENT,
+    role ENUM('admin', 'organizer', 'user') DEFAULT 'user',
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login DATETIME,
+    is_active BOOLEAN DEFAULT TRUE,
+    INDEX idx_user_email (email),
+    INDEX idx_user_role (role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- USER PROFILE TABLE (1:1 with User)
+-- ================================================================
+CREATE TABLE UserProfile (
+    user_id INT PRIMARY KEY,
+    full_name VARCHAR(255) NOT NULL,
+    department VARCHAR(255),
+    university_id INT,
+    grade INT,  -- DÜZELTME: class_year yerine grade (sınıf)
+    profile_photo VARCHAR(255),
+    bio TEXT,
+    phone_number VARCHAR(20),
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (university_id) REFERENCES University(university_id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- EVENT TABLE
+-- ================================================================
+CREATE TABLE Event (
+    event_id INT PRIMARY KEY AUTO_INCREMENT,
+    university_id INT,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    category VARCHAR(100),
+    club VARCHAR(255),
+    location VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_by INT,
+    is_active BOOLEAN DEFAULT TRUE,
+    max_participants INT,
+    FOREIGN KEY (university_id) REFERENCES University(university_id) ON DELETE SET NULL,
+    FOREIGN KEY (created_by) REFERENCES User(user_id) ON DELETE SET NULL,
+    INDEX idx_event_university (university_id),
+    INDEX idx_event_created_at (created_at),
+    INDEX idx_event_category (category),
+    INDEX idx_event_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Örnek etkinlikler
+INSERT INTO Event (university_id, title, description, location, category, club, created_by, is_active, max_participants)
+VALUES 
+(1, 'Yapay Zekâ 101', 'Giriş seviyesinde yapay zekâ ve makine öğrenmesi semineri.', 
+ 'Mühendislik Fakültesi Konferans Salonu', 'Seminer', 'Bilgisayar Kulübü', NULL, TRUE, 100),
+ 
+(2, 'Kampüs Turu', 'Yeni gelen öğrenciler için rehberli kampüs turu.', 
+ 'Beytepe Kampüsü', 'Sosyal', 'Tanıtım Kulübü', NULL, TRUE, 50),
+ 
+(3, 'Hackathon 2025', 'Yazılım yarışması - 24 saat kodlama maratonu', 
+ 'ODTÜ Bilişim Enstitüsü', 'Yarışma', 'IEEE ODTÜ', NULL, TRUE, 200),
+ 
+(4, 'Kariyer Günleri', 'Teknoloji şirketleri ile buluşma fırsatı', 
+ 'İTÜ Süleyman Demirel Kültür Merkezi', 'Kariyer', 'Kariyer Kulübü', NULL, TRUE, 500),
+ 
+(5, 'Bahar Şenliği', 'Müzik, yemek ve eğlence dolu kampüs şenliği', 
+ 'Boğaziçi Güney Kampüs', 'Sosyal', 'Öğrenci Konseyi', NULL, TRUE, 1000);
+
+-- ================================================================
+-- EVENT DATE TABLE (1:N with Event)
+-- ================================================================
+CREATE TABLE EventDate (
+    event_date_id INT PRIMARY KEY AUTO_INCREMENT,
+    event_id INT NOT NULL,
+    start_datetime DATETIME NOT NULL,
+    end_datetime DATETIME NOT NULL,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    INDEX idx_eventdate_event (event_id),
+    INDEX idx_eventdate_start (start_datetime)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Etkinlik tarihleri
+INSERT INTO EventDate (event_id, start_datetime, end_datetime) VALUES
+(1, '2025-12-10 18:00:00', '2025-12-10 20:00:00'),
+(2, '2025-12-12 14:00:00', '2025-12-12 16:00:00'),
+(3, '2025-12-15 09:00:00', '2025-12-16 09:00:00'),  -- 24 saatlik hackathon
+(4, '2025-12-20 10:00:00', '2025-12-20 18:00:00'),
+(5, '2026-04-15 12:00:00', '2026-04-15 22:00:00');
+
+-- ================================================================
+-- EVENT ATTENDANCE TABLE (M:N between User and Event)
+-- ================================================================
+CREATE TABLE EventAttendance (
+    user_id INT,
+    event_id INT,
+    status ENUM('registered', 'attending', 'cancelled', 'waitlist') DEFAULT 'registered',
+    like_event BOOLEAN DEFAULT FALSE,
+    dislike_event BOOLEAN DEFAULT FALSE,
+    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, event_id),
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    INDEX idx_attendance_event (event_id),
+    INDEX idx_attendance_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- FAVOURITE EVENTS TABLE (M:N)
+-- ================================================================
+CREATE TABLE FavouriteEvent (  -- DÜZELTME: addEventToFavourite yerine FavouriteEvent
+    user_id INT,
+    event_id INT,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, event_id),
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    INDEX idx_favourite_user (user_id),
+    INDEX idx_favourite_event (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- EVENT CHAT MESSAGE TABLE
+-- ================================================================
+CREATE TABLE EventChatMessage (
+    message_id INT PRIMARY KEY AUTO_INCREMENT,
+    event_id INT NOT NULL,
+    user_id INT NOT NULL,
+    message_text TEXT NOT NULL,
+    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    parent_message_id INT,  -- For replies/threads
+    is_edited BOOLEAN DEFAULT FALSE,
+    edited_at TIMESTAMP NULL,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_message_id) REFERENCES EventChatMessage(message_id) ON DELETE SET NULL,
+    INDEX idx_chat_event (event_id),
+    INDEX idx_chat_user (user_id),
+    INDEX idx_chat_sent_at (sent_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- HOST ROLE TABLE
+-- ================================================================
+CREATE TABLE HostRole (
+    user_id INT,
+    event_id INT,
+    role_type ENUM('host', 'co-host', 'moderator') DEFAULT 'host',
+    assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, event_id),
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    INDEX idx_host_event (event_id),
+    INDEX idx_host_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- FEEDBACK TABLE
+-- ================================================================
+CREATE TABLE Feedback (
+    feedback_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    event_id INT NOT NULL,
+    type ENUM('complaint', 'suggestion', 'praise', 'question') DEFAULT 'suggestion',
+    title VARCHAR(255),
+    message TEXT NOT NULL,
+    rating INT CHECK (rating BETWEEN 1 AND 5),  -- 1-5 yıldız
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status ENUM('pending', 'reviewed', 'resolved', 'closed') DEFAULT 'pending',
+    admin_response TEXT,
+    responded_at TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES Event(event_id) ON DELETE CASCADE,
+    INDEX idx_feedback_event (event_id),
+    INDEX idx_feedback_user (user_id),
+    INDEX idx_feedback_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- VIEWS - Sık kullanılan sorgular için
+-- ================================================================
+
+-- View 1: Aktif etkinlikler ve katılımcı sayısı
+CREATE VIEW ActiveEventsWithParticipants AS
+SELECT 
+    e.event_id,
+    e.title,
+    e.description,
+    e.category,
+    e.club,
+    e.location,
+    u.name AS university_name,
+    u.short_name AS university_short_name,
+    COUNT(DISTINCT ea.user_id) AS participant_count,
+    e.max_participants,
+    ed.start_datetime,
+    ed.end_datetime,
+    e.created_at
+FROM Event e
+LEFT JOIN University u ON e.university_id = u.university_id
+LEFT JOIN EventAttendance ea ON e.event_id = ea.event_id AND ea.status IN ('registered', 'attending')
+LEFT JOIN EventDate ed ON e.event_id = ed.event_id
+WHERE e.is_active = TRUE
+GROUP BY e.event_id, e.title, e.description, e.category, e.club, e.location, 
+         u.name, u.short_name, e.max_participants, ed.start_datetime, ed.end_datetime, e.created_at;
+
+-- View 2: Kullanıcı profil bilgileri
+CREATE VIEW UserFullProfile AS
+SELECT 
+    u.user_id,
+    u.email,
+    u.role,
+    up.full_name,
+    up.department,
+    up.grade,
+    uni.name AS university_name,
+    uni.short_name AS university_short_name,
+    up.bio,
+    up.phone_number,
+    u.created_at AS registration_date,
+    u.last_login,
+    u.is_active
+FROM User u
+LEFT JOIN UserProfile up ON u.user_id = up.user_id
+LEFT JOIN University uni ON up.university_id = uni.university_id;
+
+-- View 3: Yaklaşan etkinlikler (gelecek 30 gün)
+CREATE VIEW UpcomingEvents AS
+SELECT 
+    e.event_id,
+    e.title,
+    e.category,
+    e.location,
+    u.name AS university_name,
+    ed.start_datetime,
+    ed.end_datetime,
+    COUNT(DISTINCT ea.user_id) AS registered_count,
+    e.max_participants,
+    CASE 
+        WHEN COUNT(DISTINCT ea.user_id) >= e.max_participants THEN 'Full'
+        WHEN COUNT(DISTINCT ea.user_id) >= e.max_participants * 0.8 THEN 'Almost Full'
+        ELSE 'Available'
+    END AS availability_status
+FROM Event e
+JOIN EventDate ed ON e.event_id = ed.event_id
+LEFT JOIN University u ON e.university_id = u.university_id
+LEFT JOIN EventAttendance ea ON e.event_id = ea.event_id
+WHERE e.is_active = TRUE 
+  AND ed.start_datetime BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 30 DAY)
+GROUP BY e.event_id, e.title, e.category, e.location, u.name, 
+         ed.start_datetime, ed.end_datetime, e.max_participants;
+
+-- ================================================================
+-- ÖRNEK KULLANICILAR (Test için)
+-- ================================================================
+INSERT INTO User (email, password, role) VALUES
+('admin@example.com', '$2b$10$hashedpassword1', 'admin'),
+('ali.yilmaz@ankara.edu.tr', '$2b$10$hashedpassword2', 'user'),
+('ayse.kaya@hacettepe.edu.tr', '$2b$10$hashedpassword3', 'organizer'),
+('mehmet.demir@metu.edu.tr', '$2b$10$hashedpassword4', 'user');
+
+INSERT INTO UserProfile (user_id, full_name, department, university_id, grade, bio) VALUES
+(1, 'Admin User', 'Sistem Yöneticisi', NULL, NULL, 'Platform yöneticisi'),
+(2, 'Ali Yılmaz', 'Bilgisayar Mühendisliği', 1, 3, 'Yapay zeka meraklısı'),
+(3, 'Ayşe Kaya', 'Elektrik Elektronik Mühendisliği', 2, 4, 'Etkinlik organizatörü'),
+(4, 'Mehmet Demir', 'Yazılım Mühendisliği', 3, 2, 'Hackathon tutkunu');
+
+-- ================================================================
+-- ÖRNEK KATILIMLAR
+-- ================================================================
+INSERT INTO EventAttendance (user_id, event_id, status, like_event) VALUES
+(2, 1, 'registered', TRUE),
+(3, 1, 'attending', TRUE),
+(4, 3, 'registered', TRUE),
+(2, 3, 'registered', FALSE),
+(3, 5, 'attending', TRUE);
+
+-- ================================================================
+-- VERITABANI BİLGİLERİ
+-- ================================================================
+SELECT 'Database created successfully!' AS Status;
+SHOW TABLES;
+
+-- Tablo bilgileri
+SELECT 
+    TABLE_NAME AS 'Table',
+    TABLE_ROWS AS 'Rows',
+    ROUND(((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024), 2) AS 'Size (MB)'
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'event_management_system'
