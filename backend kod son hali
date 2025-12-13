@@ -1,14 +1,17 @@
+# app.py
 from sanic import Sanic
 from sanic.response import json, text
-import hashlib, secrets, smtplib, os
+from sanic_cors import CORS
+from dotenv import load_dotenv
+import os, secrets, smtplib, asyncio
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from dotenv import load_dotenv
-from sanic_cors import CORS
-import asyncio
 from functools import partial
-from sanic.exceptions import NotFound
-import aiomysql
+from tortoise import Tortoise, connections
+from models import (
+    User, UserProfile, Event, FavouriteEvent, Feedback,
+    ContactUserTypes, ContactTopicTypes, ContactMessages
+)
 
 # -------------------------------------------------
 # Ortam değişkenlerini yükle (.env)
@@ -19,41 +22,34 @@ app = Sanic("Campushub06")
 CORS(app)
 
 # -------------------------------------------------
-# MySQL connection pool
+# ORM init/close
 # -------------------------------------------------
 @app.listener("before_server_start")
-async def setup_db(app, loop):
-    app.ctx.db = await aiomysql.create_pool(
-        host=os.getenv("DB_HOST", "127.0.0.1"),
-        port=int(os.getenv("DB_PORT", 3306)),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASS", ""),
-        db=os.getenv("DB_NAME", "event_management_system"),
-        autocommit=True,
-        charset="utf8mb4"
+async def init_orm(app, loop):
+    db_url = (
+        f"mysql://{os.getenv('DB_USER','root')}:"
+        f"{os.getenv('DB_PASS','')}@"
+        f"{os.getenv('DB_HOST','127.0.0.1')}:"
+        f"{int(os.getenv('DB_PORT',3306))}/"
+        f"{os.getenv('DB_NAME','event_management_system')}"
     )
-    print("✅ MySQL connection pool hazır")
+    await Tortoise.init(
+        db_url=db_url,
+        modules={"models": ["models"]},
+        timezone="UTC",
+        use_tz=True,
+    )
+    print("✅ Tortoise ORM hazır")
 
 @app.listener("after_server_stop")
-async def close_db(app, loop):
-    app.ctx.db.close()
-    await app.ctx.db.wait_closed()
-    print("🔻 MySQL connection pool kapandı")
+async def close_orm(app, loop):
+    await Tortoise.close_connections()
+    print("🔻 ORM bağlantıları kapandı")
 
 
 # -------------------------------------------------
-# Yardımcı fonksiyonlar
+# Mail helper
 # -------------------------------------------------
-async def get_user_by_email(pool, email: str):
-    """User tablosundan email ile kullanıcı çek."""
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT user_id, email, password FROM User WHERE email = %s",
-                (email,)
-            )
-            return await cur.fetchone()
-
 def send_email_sync(email, reset_link):
     msg = EmailMessage()
     msg["Subject"] = "CampusHub Ankara - Şifre Sıfırlama"
@@ -69,7 +65,7 @@ def send_email_sync(email, reset_link):
 
 
 # -------------------------------------------------
-# SSS Verileri (şimdilik memory)
+# SSS Verileri (memory)
 # -------------------------------------------------
 FAQ_ITEMS = [
     {
@@ -134,14 +130,14 @@ async def home(request):
 
 
 # -------------------------------------------------
-# Kayıt Ol -> User + UserProfile
+# Kayıt Ol -> User + UserProfile (ŞİFRE DÜZ METİN)
 # -------------------------------------------------
 @app.post("/api/kayit-ol")
 async def kayit_ol(request):
-    data = request.json
-    email = data.get("email", "").strip().lower()
-    full_name = data.get("name", "").strip()
-    password = data.get("password", "")
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
+    full_name = (data.get("name") or "").strip()
+    password = data.get("password") or ""
 
     if not email or not password or not full_name:
         return json({"basarili": False, "mesaj": "Tüm alanları doldurmanız gerekiyor."}, status=400)
@@ -149,82 +145,55 @@ async def kayit_ol(request):
     if len(password) < 6:
         return json({"basarili": False, "mesaj": "Şifre en az 6 karakter olmalıdır."}, status=400)
 
-    hashed = hashlib.sha256(password.encode()).hexdigest()
+    existing = await User.get_or_none(email=email)
+    if existing:
+        return json({"basarili": False, "mesaj": "Bu e-posta zaten kayıtlı."}, status=409)
 
-    pool = request.app.ctx.db
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            # Bu email zaten var mı?
-            await cur.execute("SELECT user_id FROM User WHERE email = %s", (email,))
-            existing = await cur.fetchone()
-            if existing:
-                return json({"basarili": False, "mesaj": "Bu e-posta zaten kayıtlı."}, status=409)
-
-            # User tablosuna ekle
-            await cur.execute(
-                "INSERT INTO User (email, password) VALUES (%s, %s)",
-                (email, hashed)
-            )
-            user_id = cur.lastrowid
-
-            # UserProfile tablosuna isim ekle
-            await cur.execute(
-                "INSERT INTO UserProfile (user_id, full_name) VALUES (%s, %s)",
-                (user_id, full_name)
-            )
+    user = await User.create(email=email, password=password)
+    await UserProfile.create(user=user, full_name=full_name)
 
     return json({"basarili": True, "mesaj": "Hesabınız başarıyla oluşturuldu!"}, status=201)
 
 
 # -------------------------------------------------
-# Giriş
+# Giriş (ŞİFRE DÜZ METİN)
 # -------------------------------------------------
 @app.post("/api/giris")
 async def giris(request):
-    data = request.json
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
     if not email or not password:
         return json({"basarili": False, "mesaj": "E-posta ve şifre gerekli."}, status=400)
 
-    pool = request.app.ctx.db
-    user = await get_user_by_email(pool, email)
-
+    user = await User.get_or_none(email=email)
     if not user:
         return json({"basarili": False, "mesaj": "Bu e-posta ile kayıt bulunamadı."}, status=404)
 
-    hashed = hashlib.sha256(password.encode()).hexdigest()
-    if user["password"] != hashed:
+    if user.password != password:
         return json({"basarili": False, "mesaj": "Şifre yanlış."}, status=401)
 
-    # last_login güncelle
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE User SET last_login = NOW() WHERE user_id = %s",
-                (user["user_id"],)
-            )
+    user.last_login = datetime.now()
+    await user.save(update_fields=["last_login"])
 
     return json({"basarili": True, "mesaj": "Hoş geldin!"}, status=200)
 
 
 # -------------------------------------------------
-# Şifremi Unuttum
+# Şifremi Unuttum (TOKENLAR KALSIN)
 # -------------------------------------------------
 RESET_TOKENS = {}
 
 @app.post("/api/sifremi-unuttum")
 async def sifremi_unuttum(request):
-    data = request.json
-    email = data.get("email", "").strip().lower()
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
 
     if not email:
         return json({"basarili": False, "mesaj": "E-posta girmelisiniz."}, status=400)
 
-    pool = request.app.ctx.db
-    user = await get_user_by_email(pool, email)
-
+    user = await User.get_or_none(email=email)
     if not user:
         return json({"basarili": False, "mesaj": "Bu e-posta sistemde kayıtlı değil."}, status=404)
 
@@ -244,11 +213,11 @@ async def sifremi_unuttum(request):
 
 
 # -------------------------------------------------
-# Şifre Sıfırla
+# Şifre Sıfırla (ŞİFRE DÜZ METİN)
 # -------------------------------------------------
 @app.post("/api/sifre-sifirla")
 async def sifre_sifirla(request):
-    data = request.json
+    data = request.json or {}
     token = data.get("token", "")
     new_password = data.get("password", "")
 
@@ -262,15 +231,12 @@ async def sifre_sifirla(request):
         return json({"basarili": False, "mesaj": "Şifre en az 6 karakter olmalıdır."}, status=400)
 
     email = entry["email"]
-    hashed = hashlib.sha256(new_password.encode()).hexdigest()
+    user = await User.get_or_none(email=email)
+    if not user:
+        return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
 
-    pool = request.app.ctx.db
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE User SET password = %s WHERE email = %s",
-                (hashed, email)
-            )
+    user.password = new_password
+    await user.save(update_fields=["password"])
 
     del RESET_TOKENS[token]
 
@@ -278,20 +244,12 @@ async def sifre_sifirla(request):
 
 
 # -------------------------------------------------
-# Etkinlikler (Event + EventDate + University)
+# Etkinlikler (SQL query + ORM connection)
 # -------------------------------------------------
 @app.get("/api/etkinlikler")
 async def etkinlikler(request):
-    """
-    Tüm etkinlikleri veya filtrelenmiş etkinlikleri veritabanından döner.
-    Query parametreleri:
-      - university  (üniversite adı - University.name)
-      - date        (YYYY-MM-DD formatında, EventDate.start_datetime üzerinden)
-    """
     university_name = request.args.get("university")
     date_str = request.args.get("date")
-
-    pool = request.app.ctx.db
 
     query = """
         SELECT 
@@ -322,81 +280,61 @@ async def etkinlikler(request):
         ORDER BY e.created_at DESC
     """
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query, params)
-            rows = await cur.fetchall()
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(query, params)
 
     etkinlikler_list = []
     for r in rows:
-        if r["start_datetime"]:
-            date_out = r["start_datetime"].strftime("%Y-%m-%d")
-            time_out = r["start_datetime"].strftime("%H:%M")
-        else:
-            date_out = None
-            time_out = None
-
+        sd = r["start_datetime"]
         etkinlikler_list.append({
             "id": r["id"],
             "title": r["title"],
             "university": r["university"],
             "location": r["location"],
             "description": r["description"],
-            "date": date_out,
-            "time": time_out,
+            "date": sd.strftime("%Y-%m-%d") if sd else None,
+            "time": sd.strftime("%H:%M") if sd else None,
         })
 
-    return json({
-        "basarili": True,
-        "adet": len(etkinlikler_list),
-        "etkinlikler": etkinlikler_list
-    })
+    return json({"basarili": True, "adet": len(etkinlikler_list), "etkinlikler": etkinlikler_list})
 
 
 # -------------------------------------------------
-# Takvime Ekle -> addEventToFavourite
+# Takvime Ekle (FavouriteEvent)
 # -------------------------------------------------
 @app.post("/api/takvim/ekle")
 async def takvime_ekle(request):
-    data = request.json
-    email = data.get("email", "").strip().lower()
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
     event_id = data.get("event_id")
 
     if not email or not event_id:
         return json({"basarili": False, "mesaj": "Email ve event_id gerekli."}, status=400)
 
-    pool = request.app.ctx.db
-    user = await get_user_by_email(pool, email)
+    user = await User.get_or_none(email=email)
     if not user:
         return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT event_id FROM Event WHERE event_id = %s", (event_id,))
-            exists = await cur.fetchone()
-            if not exists:
-                return json({"basarili": False, "mesaj": "Etkinlik bulunamadı."}, status=404)
+    event = await Event.get_or_none(event_id=event_id)
+    if not event:
+        return json({"basarili": False, "mesaj": "Etkinlik bulunamadı."}, status=404)
 
-            await cur.execute(
-                "INSERT IGNORE INTO addEventToFavourite (user_id, event_id) VALUES (%s, %s)",
-                (user["user_id"], event_id)
-            )
+    await FavouriteEvent.get_or_create(user=user, event=event)
 
     return json({"basarili": True, "mesaj": "Etkinlik takvime/favorilere eklendi."}, status=200)
 
 
 # -------------------------------------------------
-# Kullanıcının takvimi
+# Kullanıcının takvimi (FavouriteEvent)
 # -------------------------------------------------
 @app.get("/api/takvim")
 async def takvim(request):
-    email = request.args.get("email", "").strip().lower()
+    email = (request.args.get("email") or "").strip().lower()
 
     if not email:
         return json({"basarili": False, "mesaj": "Email gerekli."}, status=400)
 
-    pool = request.app.ctx.db
-    user = await get_user_by_email(pool, email)
+    user = await User.get_or_none(email=email)
     if not user:
         return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
 
@@ -409,7 +347,7 @@ async def takvim(request):
             uni.name AS university,
             MIN(ed.start_datetime) AS start_datetime,
             MAX(ed.end_datetime) AS end_datetime
-        FROM addEventToFavourite f
+        FROM FavouriteEvent f
         JOIN Event e ON f.event_id = e.event_id
         LEFT JOIN University uni ON e.university_id = uni.university_id
         LEFT JOIN EventDate ed ON e.event_id = ed.event_id
@@ -418,35 +356,23 @@ async def takvim(request):
         ORDER BY e.created_at DESC
     """
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query, (user["user_id"],))
-            rows = await cur.fetchall()
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(query, [user.user_id])
 
     user_events = []
     for r in rows:
-        if r["start_datetime"]:
-            date_out = r["start_datetime"].strftime("%Y-%m-%d")
-            time_out = r["start_datetime"].strftime("%H:%M")
-        else:
-            date_out = None
-            time_out = None
-
+        sd = r["start_datetime"]
         user_events.append({
             "id": r["id"],
             "title": r["title"],
             "university": r["university"],
             "location": r["location"],
             "description": r["description"],
-            "date": date_out,
-            "time": time_out
+            "date": sd.strftime("%Y-%m-%d") if sd else None,
+            "time": sd.strftime("%H:%M") if sd else None,
         })
 
-    return json({
-        "basarili": True,
-        "adet": len(user_events),
-        "etkinlikler": user_events
-    })
+    return json({"basarili": True, "adet": len(user_events), "etkinlikler": user_events})
 
 
 # -------------------------------------------------
@@ -465,7 +391,7 @@ async def get_single_faq(request, faq_id):
 
 
 # -------------------------------------------------
-# Feedback API (Feedback tablosu)
+# Feedback (ORM)
 # -------------------------------------------------
 @app.post("/api/feedback")
 async def create_feedback(request):
@@ -473,51 +399,31 @@ async def create_feedback(request):
 
     email = (data.get("email") or "").strip().lower()
     event_id = data.get("event_id")
-    fb_type = (data.get("type") or "").strip()
-    title = (data.get("title") or "").strip()
+    fb_type = (data.get("type") or "").strip() or None
+    title = (data.get("title") or "").strip() or None
     message = (data.get("message") or "").strip()
 
     if not email or not event_id or not message:
-        return json({
-            "basarili": False,
-            "mesaj": "E-posta, etkinlik ve mesaj alanları zorunludur."
-        }, status=400)
+        return json({"basarili": False, "mesaj": "E-posta, etkinlik ve mesaj alanları zorunludur."}, status=400)
 
-    pool = request.app.ctx.db
-    user = await get_user_by_email(pool, email)
+    user = await User.get_or_none(email=email)
     if not user:
-        return json({
-            "basarili": False,
-            "mesaj": "Bu e-posta ile kayıtlı kullanıcı bulunamadı."
-        }, status=404)
+        return json({"basarili": False, "mesaj": "Bu e-posta ile kayıtlı kullanıcı bulunamadı."}, status=404)
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT event_id FROM Event WHERE event_id = %s",
-                (event_id,)
-            )
-            event = await cur.fetchone()
-            if not event:
-                return json({
-                    "basarili": False,
-                    "mesaj": "Etkinlik bulunamadı."
-                }, status=404)
+    event = await Event.get_or_none(event_id=event_id)
+    if not event:
+        return json({"basarili": False, "mesaj": "Etkinlik bulunamadı."}, status=404)
 
-            await cur.execute(
-                """
-                INSERT INTO Feedback (user_id, event_id, type, title, message, status)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (user["user_id"], event_id, fb_type or None, title or None, message, "pending")
-            )
-            feedback_id = cur.lastrowid
+    fb = await Feedback.create(
+        user=user,
+        event=event,
+        type=fb_type,
+        title=title,
+        message=message,
+        status="pending"
+    )
 
-    return json({
-        "basarili": True,
-        "mesaj": "Geri bildiriminiz alındı. Teşekkür ederiz.",
-        "feedback_id": feedback_id
-    }, status=201)
+    return json({"basarili": True, "mesaj": "Geri bildiriminiz alındı. Teşekkür ederiz.", "feedback_id": fb.feedback_id}, status=201)
 
 
 @app.get("/api/feedback")
@@ -525,51 +431,30 @@ async def list_feedback(request):
     event_id = request.args.get("event_id")
     status = request.args.get("status")
 
-    pool = request.app.ctx.db
-
-    query = """
-        SELECT 
-            f.feedback_id,
-            u.email,
-            f.event_id,
-            f.type,
-            f.title,
-            f.message,
-            f.status,
-            f.created_at
-        FROM Feedback f
-        JOIN User u ON f.user_id = u.user_id
-        WHERE 1=1
-    """
-    params = []
+    q = Feedback.all().prefetch_related("user")
 
     if event_id:
-        query += " AND f.event_id = %s"
-        params.append(event_id)
-
+        q = q.filter(event_id=event_id)
     if status:
-        query += " AND f.status = %s"
-        params.append(status)
+        q = q.filter(status=status)
 
-    query += " ORDER BY f.created_at DESC"
+    rows = await q.order_by("-created_at").values(
+        "feedback_id",
+        "event_id",
+        "type",
+        "title",
+        "message",
+        "status",
+        "created_at",
+        email="user__email"
+    )
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query, params)
-            rows = await cur.fetchall()
-
-    return json({
-        "basarili": True,
-        "adet": len(rows),
-        "feedbackler": rows
-    }, status=200)
+    return json({"basarili": True, "adet": len(rows), "feedbackler": rows}, status=200)
 
 
 # -------------------------------------------------
-# CONTACT / İLETİŞİM API (DB TABLOLARI İLE)
+# CONTACT / İLETİŞİM API
 # -------------------------------------------------
-
-# Statik içerik endpointleri (header, cards, vs.)
 @app.get("/api/contact/header")
 async def contact_header(request):
     return json({
@@ -629,69 +514,24 @@ async def contact_team(request):
     return json({
         "title": "CampusHub Ekibi",
         "members": [
-            {
-                "name": "İlayda Ceylan",
-                "roles": ["Backend", "CI/CD"],
-                "photo": None,
-            },
-            {
-                "name": "Zeynep Bahar Arık",
-                "roles": ["Frontend", "Data Layer", "Testing"],
-                "photo": None,
-            },
-            {
-                "name": "Zeynepnaz Yüksel",
-                "roles": ["Backend", "Frontend", "Testing"],
-                "photo": None,
-            },
-            {
-                "name": "Buğra Kılıç",
-                "roles": ["Backend", "CI/CD"],
-                "photo": None,
-            },
-            {
-                "name": "Osman Kapan Mahir",
-                "roles": ["Frontend", "Data Layer"],
-                "photo": None,
-            },
+            {"name": "İlayda Ceylan", "roles": ["Backend", "CI/CD"], "photo": None},
+            {"name": "Zeynep Bahar Arık", "roles": ["Frontend", "Data Layer", "Testing"], "photo": None},
+            {"name": "Zeynepnaz Yüksel", "roles": ["Backend", "Frontend", "Testing"], "photo": None},
+            {"name": "Buğra Kılıç", "roles": ["Backend", "CI/CD"], "photo": None},
+            {"name": "Osman Kapan Mahir", "roles": ["Frontend", "Data Layer"], "photo": None},
         ]
     })
 
-# Form seçeneklerini DB'den okuyan endpoint
 @app.get("/api/contact/form-options")
 async def contact_form_options(request):
-    """
-    ContactUserTypes ve ContactTopicTypes tablolarından
-    aktif kullanıcı tipi ve konu tiplerini döner.
-    """
-    pool = request.app.ctx.db
-
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            # Kullanıcı tipleri
-            await cur.execute(
-                "SELECT id, label FROM ContactUserTypes WHERE is_active = TRUE ORDER BY id"
-            )
-            user_types = await cur.fetchall()
-
-            # Konu tipleri
-            await cur.execute(
-                "SELECT id, label FROM ContactTopicTypes WHERE is_active = TRUE ORDER BY id"
-            )
-            topic_types = await cur.fetchall()
-
-    return json({
-        "user_types": user_types,
-        "topic_types": topic_types,
-    }, status=200)
-
+    user_types = await ContactUserTypes.filter(is_active=True).order_by("id").values("id", "label")
+    topic_types = await ContactTopicTypes.filter(is_active=True).order_by("id").values("id", "label")
+    return json({"user_types": user_types, "topic_types": topic_types}, status=200)
 
 @app.get("/api/contact")
 async def contact_get(request):
     return json({"ok": True, "message": "Contact endpoint çalışıyor!"}, status=200)
 
-
-# Contact form POST -> ContactMessages tablosuna kaydeder
 @app.post("/api/contact")
 async def contact_post(request):
     data = request.json or {}
@@ -706,100 +546,49 @@ async def contact_post(request):
 
     required_fields = ["full_name", "email", "university", "user_type", "topic", "message"]
     missing = [f for f in required_fields if not data.get(f)]
-
     if consent is not True:
         missing.append("consent")
 
     if missing:
-        return json({
-            "ok": False,
-            "error": "Eksik veya doldurulmamış alanlar var.",
-            "missing": missing
-        }, status=400)
+        return json({"ok": False, "error": "Eksik veya doldurulmamış alanlar var.", "missing": missing}, status=400)
 
     if "@" not in email:
         return json({"ok": False, "error": "Geçersiz e-posta adresi."}, status=400)
 
-    pool = request.app.ctx.db
+    ut = await ContactUserTypes.get_or_none(label=user_type_label, is_active=True)
+    if not ut:
+        return json({"ok": False, "error": "Geçersiz kullanıcı tipi."}, status=400)
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            # user_type_label -> ContactUserTypes.id
-            await cur.execute(
-                "SELECT id FROM ContactUserTypes WHERE label = %s AND is_active = TRUE",
-                (user_type_label,)
-            )
-            user_type_row = await cur.fetchone()
-            if not user_type_row:
-                return json({"ok": False, "error": "Geçersiz kullanıcı tipi."}, status=400)
+    tt = await ContactTopicTypes.get_or_none(label=topic_label, is_active=True)
+    if not tt:
+        return json({"ok": False, "error": "Geçersiz mesaj türü."}, status=400)
 
-            user_type_id = user_type_row["id"]
+    contact_msg = await ContactMessages.create(
+        full_name=full_name,
+        email=email,
+        university=university,
+        user_type=ut,
+        topic_type=tt,
+        message=message_text,
+        consent=True
+    )
 
-            # topic_label -> ContactTopicTypes.id
-            await cur.execute(
-                "SELECT id FROM ContactTopicTypes WHERE label = %s AND is_active = TRUE",
-                (topic_label,)
-            )
-            topic_row = await cur.fetchone()
-            if not topic_row:
-                return json({"ok": False, "error": "Geçersiz mesaj türü."}, status=400)
+    return json({"ok": True, "message": "İletişim formu başarıyla alındı.", "contact_id": contact_msg.contact_id}, status=201)
 
-            topic_type_id = topic_row["id"]
-
-            # ContactMessages tablosuna ekle
-            await cur.execute(
-                """
-                INSERT INTO ContactMessages 
-                (full_name, email, university, user_type_id, topic_type_id, message, consent)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (full_name, email, university, user_type_id, topic_type_id, message_text, True)
-            )
-            contact_id = cur.lastrowid
-
-    return json({
-        "ok": True,
-        "message": "İletişim formu başarıyla alındı.",
-        "contact_id": contact_id
-    }, status=201)
-
-
-# Contact mesajlarını DB'den listeleme
 @app.get("/api/contact/messages")
 async def list_messages(request):
-    """
-    ContactMessages + tip label'larıyla birlikte listeler.
-    İleride admin panelde kullanmak için güzel olur.
-    """
-    pool = request.app.ctx.db
-
-    query = """
-        SELECT 
-            c.contact_id,
-            c.full_name,
-            c.email,
-            c.university,
-            ut.label AS user_type,
-            tt.label AS topic_type,
-            c.message,
-            c.consent,
-            c.created_at
-        FROM ContactMessages c
-        LEFT JOIN ContactUserTypes ut ON c.user_type_id = ut.id
-        LEFT JOIN ContactTopicTypes tt ON c.topic_type_id = tt.id
-        ORDER BY c.created_at DESC
-    """
-
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query)
-            rows = await cur.fetchall()
-
-    return json({
-        "ok": True,
-        "count": len(rows),
-        "messages": rows
-    }, status=200)
+    rows = await ContactMessages.all().prefetch_related("user_type", "topic_type").order_by("-created_at").values(
+        "contact_id",
+        "full_name",
+        "email",
+        "university",
+        "message",
+        "consent",
+        "created_at",
+        user_type="user_type__label",
+        topic_type="topic_type__label",
+    )
+    return json({"ok": True, "count": len(rows), "messages": rows}, status=200)
 
 
 # -------------------------------------------------
