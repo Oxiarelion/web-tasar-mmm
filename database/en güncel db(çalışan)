@@ -118,4 +118,169 @@ CREATE TABLE event_chat_messages (
     edited_at TIMESTAMP NULL,
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_message_id) REFERENCES event_chat
+    FOREIGN KEY (parent_message_id) REFERENCES event_chat_messages(message_id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- HOST ROLES
+CREATE TABLE host_roles (
+    user_id INT,
+    event_id INT,
+    role_type ENUM('host', 'co-host', 'moderator') DEFAULT 'host',
+    assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, event_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- FEEDBACKS
+CREATE TABLE feedbacks (
+    feedback_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    event_id INT NOT NULL,
+    type ENUM('complaint', 'suggestion', 'praise', 'question') DEFAULT 'suggestion',
+    title VARCHAR(255),
+    message TEXT NOT NULL,
+    rating INT CHECK (rating BETWEEN 1 AND 5),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status ENUM('pending', 'reviewed', 'resolved', 'closed') DEFAULT 'pending',
+    admin_response TEXT,
+    responded_at TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- CONTACT TABLES
+CREATE TABLE contact_user_types (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    label VARCHAR(100) NOT NULL UNIQUE,
+    is_active BOOLEAN DEFAULT TRUE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE contact_topic_types (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    label VARCHAR(100) NOT NULL UNIQUE,
+    is_active BOOLEAN DEFAULT TRUE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE contact_messages (
+    contact_id INT PRIMARY KEY AUTO_INCREMENT,
+    full_name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    university VARCHAR(255) NOT NULL,
+    user_type_id INT NOT NULL,
+    topic_type_id INT NOT NULL,
+    message TEXT NOT NULL,
+    consent BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_type_id) REFERENCES contact_user_types(id),
+    FOREIGN KEY (topic_type_id) REFERENCES contact_topic_types(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================================================================
+-- 2. GÖRÜNÜMLER (VIEWS) - Yeni tablo isimlerine göre güncellendi
+-- ================================================================
+
+-- View 1: Aktif etkinlikler ve katılımcı sayısı
+CREATE OR REPLACE VIEW ActiveEventsWithParticipants AS
+SELECT 
+    e.event_id,
+    e.title,
+    e.description,
+    e.category,
+    e.club,
+    e.location,
+    u.name AS university_name,
+    u.short_name AS university_short_name,
+    COUNT(DISTINCT ea.user_id) AS participant_count,
+    e.max_participants,
+    ed.start_datetime,
+    ed.end_datetime,
+    e.created_at
+FROM events e
+LEFT JOIN universities u ON e.university_id = u.university_id
+LEFT JOIN event_attendance ea ON e.event_id = ea.event_id AND ea.status IN ('registered', 'attending')
+LEFT JOIN event_dates ed ON e.event_id = ed.event_id
+WHERE e.is_active = TRUE
+GROUP BY e.event_id, e.title, e.description, e.category, e.club, e.location, 
+         u.name, u.short_name, e.max_participants, ed.start_datetime, ed.end_datetime, e.created_at;
+
+-- View 2: Kullanıcı profil bilgileri
+CREATE OR REPLACE VIEW UserFullProfile AS
+SELECT 
+    u.user_id,
+    u.email,
+    u.role,
+    up.full_name,
+    up.department,
+    up.grade,
+    uni.name AS university_name,
+    uni.short_name AS university_short_name,
+    up.bio,
+    up.phone_number,
+    u.created_at AS registration_date,
+    u.last_login,
+    u.is_active
+FROM users u
+LEFT JOIN user_profiles up ON u.user_id = up.user_id
+LEFT JOIN universities uni ON up.university_id = uni.university_id;
+
+-- View 3: Yaklaşan etkinlikler (gelecek 30 gün)
+CREATE OR REPLACE VIEW UpcomingEvents AS
+SELECT 
+    e.event_id,
+    e.title,
+    e.category,
+    e.location,
+    u.name AS university_name,
+    ed.start_datetime,
+    ed.end_datetime,
+    COUNT(DISTINCT ea.user_id) AS registered_count,
+    e.max_participants,
+    CASE 
+        WHEN COUNT(DISTINCT ea.user_id) >= e.max_participants THEN 'Full'
+        WHEN COUNT(DISTINCT ea.user_id) >= e.max_participants * 0.8 THEN 'Almost Full'
+        ELSE 'Available'
+    END AS availability_status
+FROM events e
+JOIN event_dates ed ON e.event_id = ed.event_id
+LEFT JOIN universities u ON e.university_id = u.university_id
+LEFT JOIN event_attendance ea ON e.event_id = ea.event_id
+WHERE e.is_active = TRUE 
+  AND ed.start_datetime BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 30 DAY)
+GROUP BY e.event_id, e.title, e.category, e.location, u.name, 
+         ed.start_datetime, ed.end_datetime, e.max_participants;
+
+-- ================================================================
+-- 3. ÖRNEK VERİLER (SAMPLE DATA)
+-- ================================================================
+
+-- Üniversiteler
+INSERT INTO universities (name, short_name, website_url) VALUES
+('Ankara Üniversitesi', 'AÜ', 'https://www.ankara.edu.tr'),
+('Hacettepe Üniversitesi', 'HÜ', 'https://www.hacettepe.edu.tr'),
+('ODTÜ', 'ODTÜ', 'https://www.metu.edu.tr'),
+('İstanbul Teknik Üniversitesi', 'İTÜ', 'https://www.itu.edu.tr'),
+('Boğaziçi Üniversitesi', 'BOÜN', 'https://www.boun.edu.tr');
+
+-- Kullanıcılar (Test Şifresi: 123456)
+INSERT INTO users (email, password, role, name) VALUES
+('admin@example.com', '123456', 'admin', 'Sistem Admini'),
+('ali.yilmaz@ankara.edu.tr', '123456', 'user', 'Ali Yılmaz'),
+('ayse.kaya@hacettepe.edu.tr', '123456', 'organizer', 'Ayşe Kaya'),
+('test@gmail.com', '123456', 'user', 'Test Kullanıcısı');
+
+-- Etkinlikler
+INSERT INTO events (university_id, title, description, location, category, club, created_by, is_active, max_participants) VALUES 
+(1, 'Yapay Zekâ 101', 'Giriş seviyesinde yapay zekâ ve makine öğrenmesi semineri.', 'Mühendislik Fakültesi', 'Seminer', 'Bilgisayar Kulübü', 1, TRUE, 100),
+(2, 'Kampüs Turu', 'Yeni gelenler için rehberli tur.', 'Beytepe Kampüsü', 'Sosyal', 'Tanıtım Kulübü', 1, TRUE, 50),
+(3, 'Hackathon 2025', '24 saat kodlama maratonu.', 'ODTÜ Bilişim Enstitüsü', 'Yarışma', 'IEEE ODTÜ', 1, TRUE, 200),
+(4, 'Bahar Şenliği', 'Müzik ve eğlence.', 'Güney Kampüs', 'Sosyal', 'Öğrenci Konseyi', 1, TRUE, 1000);
+
+-- Etkinlik Tarihleri
+INSERT INTO event_dates (event_id, start_datetime, end_datetime) VALUES
+(1, NOW() + INTERVAL 2 DAY, NOW() + INTERVAL 2 DAY + INTERVAL 2 HOUR),
+(2, NOW() + INTERVAL 5 DAY, NOW() + INTERVAL 5 DAY + INTERVAL 4 HOUR),
+(3, NOW() + INTERVAL 10 DAY, NOW() + INTERVAL 11 DAY),
+(4, NOW() + INTERVAL 20 DAY, NOW() + INTERVAL 20 DAY + INTERVAL 8 HOUR);
+
+SET FOREIGN_KEY_CHECKS = 1;
