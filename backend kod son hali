@@ -1,9 +1,14 @@
 # app.py
+from dotenv import load_dotenv
+import os
+
+# Importlardan hemen sonra bu satırı ekle:
+load_dotenv()  # <-- BU KOMUT .env DOSYASINI OKUR
+
 from sanic import Sanic
 from sanic.response import json, text
 from sanic_cors import CORS
-from dotenv import load_dotenv
-import os, secrets, smtplib, asyncio
+import secrets, smtplib, asyncio
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from functools import partial
@@ -13,11 +18,6 @@ from models import (
     ContactUserTypes, ContactTopicTypes, ContactMessages
 )
 
-# -------------------------------------------------
-# Ortam değişkenlerini yükle (.env)
-# -------------------------------------------------
-load_dotenv()
-
 app = Sanic("Campushub06")
 CORS(app)
 
@@ -26,10 +26,11 @@ CORS(app)
 # -------------------------------------------------
 @app.listener("before_server_start")
 async def init_orm(app, loop):
+    print(f"🌍 Bağlanılan Veritabanı Hostu: {os.getenv('DB_HOST')}")
     db_url = (
         f"mysql://{os.getenv('DB_USER','root')}:"
-        f"{os.getenv('DB_PASS','')}@"
-        f"{os.getenv('DB_HOST','127.0.0.1')}:"
+        f"{os.getenv('DB_PASS','')}"
+        f"@{os.getenv('DB_HOST','127.0.0.1')}:"
         f"{int(os.getenv('DB_PORT',3306))}/"
         f"{os.getenv('DB_NAME','event_management_system')}"
     )
@@ -39,6 +40,7 @@ async def init_orm(app, loop):
         timezone="UTC",
         use_tz=True,
     )
+    await Tortoise.generate_schemas()
     print("✅ Tortoise ORM hazır")
 
 @app.listener("after_server_stop")
@@ -175,7 +177,7 @@ async def giris(request):
         return json({"basarili": False, "mesaj": "Şifre yanlış."}, status=401)
 
     user.last_login = datetime.now()
-    await user.save(update_fields=["last_login"])
+    #await user.save(update_fields=["last_login"])
 
     return json({"basarili": True, "mesaj": "Hoş geldin!"}, status=200)
 
@@ -246,11 +248,16 @@ async def sifre_sifirla(request):
 # -------------------------------------------------
 # Etkinlikler (SQL query + ORM connection)
 # -------------------------------------------------
+# --- SADECE BU FONKSİYONU DEĞİŞTİR ---
 @app.get("/api/etkinlikler")
 async def etkinlikler(request):
+    print("--------------------------------------------------")
+    print("📡 REACT'TAN İSTEK GELDİ: /api/etkinlikler")
+    
     university_name = request.args.get("university")
     date_str = request.args.get("date")
 
+    # Tablo isimleri küçük harf (events, universities, event_dates)
     query = """
         SELECT 
             e.event_id AS id,
@@ -260,9 +267,9 @@ async def etkinlikler(request):
             uni.name AS university,
             MIN(ed.start_datetime) AS start_datetime,
             MAX(ed.end_datetime) AS end_datetime
-        FROM Event e
-        LEFT JOIN University uni ON e.university_id = uni.university_id
-        LEFT JOIN EventDate ed ON e.event_id = ed.event_id
+        FROM events e
+        LEFT JOIN universities uni ON e.university_id = uni.university_id
+        LEFT JOIN event_dates ed ON e.event_id = ed.event_id
         WHERE e.is_active = TRUE
     """
     params = []
@@ -280,23 +287,36 @@ async def etkinlikler(request):
         ORDER BY e.created_at DESC
     """
 
-    conn = connections.get("default")
-    rows = await conn.execute_query_dict(query, params)
+    try:
+        conn = connections.get("default")
+        # SQL Sorgusunu terminale basalım ki ne çalıştırdığını görelim
+        print(f"🔍 ÇALIŞTIRILAN SQL:\n{query}")
+        
+        rows = await conn.execute_query_dict(query, params)
+        
+        # KAÇ KAYIT BULDUĞUNU YAZDIRALIM
+        print(f"✅ VERİTABANINDAN DÖNEN KAYIT SAYISI: {len(rows)}")
+        
+        etkinlikler_list = []
+        for r in rows:
+            sd = r["start_datetime"]
+            print(f"   -> Bulunan Etkinlik: {r['title']} ({r['university']})")
+            etkinlikler_list.append({
+                "id": r["id"],
+                "title": r["title"],
+                "university": r["university"],
+                "location": r["location"],
+                "description": r["description"],
+                "date": sd.strftime("%Y-%m-%d") if sd else None,
+                "time": sd.strftime("%H:%M") if sd else None,
+            })
 
-    etkinlikler_list = []
-    for r in rows:
-        sd = r["start_datetime"]
-        etkinlikler_list.append({
-            "id": r["id"],
-            "title": r["title"],
-            "university": r["university"],
-            "location": r["location"],
-            "description": r["description"],
-            "date": sd.strftime("%Y-%m-%d") if sd else None,
-            "time": sd.strftime("%H:%M") if sd else None,
-        })
-
-    return json({"basarili": True, "adet": len(etkinlikler_list), "etkinlikler": etkinlikler_list})
+        print("--------------------------------------------------")
+        return json({"basarili": True, "adet": len(etkinlikler_list), "etkinlikler": etkinlikler_list})
+        
+    except Exception as e:
+        print(f"❌ HATA OLUŞTU: {str(e)}")
+        return json({"basarili": False, "hata": str(e)}, status=500)
 
 
 # -------------------------------------------------
@@ -338,6 +358,7 @@ async def takvim(request):
     if not user:
         return json({"basarili": False, "mesaj": "Kullanıcı bulunamadı."}, status=404)
 
+    # BURADA DÜZELTME YAPILDI: Tablo isimleri küçük harf yapıldı.
     query = """
         SELECT
             e.event_id AS id,
@@ -347,10 +368,10 @@ async def takvim(request):
             uni.name AS university,
             MIN(ed.start_datetime) AS start_datetime,
             MAX(ed.end_datetime) AS end_datetime
-        FROM FavouriteEvent f
-        JOIN Event e ON f.event_id = e.event_id
-        LEFT JOIN University uni ON e.university_id = uni.university_id
-        LEFT JOIN EventDate ed ON e.event_id = ed.event_id
+        FROM favourite_events f
+        JOIN events e ON f.event_id = e.event_id
+        LEFT JOIN universities uni ON e.university_id = uni.university_id
+        LEFT JOIN event_dates ed ON e.event_id = ed.event_id
         WHERE f.user_id = %s
         GROUP BY e.event_id, e.title, e.description, e.location, uni.name
         ORDER BY e.created_at DESC
@@ -518,7 +539,7 @@ async def contact_team(request):
             {"name": "Zeynep Bahar Arık", "roles": ["Frontend", "Data Layer", "Testing"], "photo": None},
             {"name": "Zeynepnaz Yüksel", "roles": ["Backend", "Frontend", "Testing"], "photo": None},
             {"name": "Buğra Kılıç", "roles": ["Backend", "CI/CD"], "photo": None},
-            {"name": "Osman Kapan Mahir", "roles": ["Frontend", "Data Layer"], "photo": None},
+            {"name": "Osman Kağan Mahir", "roles": ["Frontend", "Data Layer"], "photo": None},
         ]
     })
 
@@ -596,3 +617,11 @@ async def list_messages(request):
 # -------------------------------------------------
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8000, debug=True)
+
+
+
+
+
+
+
+    
